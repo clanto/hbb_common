@@ -36,8 +36,10 @@ use crate::{
     compress::{compress, decompress},
     log,
     password_security::{
-        decrypt_str_or_original, decrypt_vec_or_original, encrypt_str_or_original,
-        encrypt_vec_or_original, symmetric_crypt,
+        decrypt_str_or_original_scoped, decrypt_vec_or_original_scoped,
+        encrypt_str_or_original_scoped, encrypt_vec_or_original_scoped, is_scoped_crypt_payload,
+        is_scoped_encrypted, key_available, key_provider_registered, preserve_stored_value,
+        symmetric_crypt_scoped, KeyScope,
     },
 };
 
@@ -213,6 +215,8 @@ pub struct Config {
     pub id: String, // use
     #[serde(default, deserialize_with = "deserialize_string")]
     enc_id: String, // store
+    #[serde(skip)]
+    id_protected_unavailable: bool,
     #[serde(default, deserialize_with = "deserialize_string")]
     password: String,
     #[serde(default, deserialize_with = "deserialize_string")]
@@ -492,15 +496,25 @@ impl Config2 {
         let mut store = false;
         if let Some(mut socks) = config.socks {
             let (password, _, store2) =
-                decrypt_str_or_original(&socks.password, PASSWORD_ENC_VERSION);
+                decrypt_str_or_original_scoped(&socks.password, KeyScope::Machine);
             socks.password = password;
             config.socks = Some(socks);
             store |= store2;
         }
         let (unlock_pin, _, store2) =
-            decrypt_str_or_original(&config.unlock_pin, PASSWORD_ENC_VERSION);
+            decrypt_str_or_original_scoped(&config.unlock_pin, KeyScope::Machine);
         config.unlock_pin = unlock_pin;
         store |= store2;
+        let (trusted_devices, decrypted, store2) =
+            decrypt_str_or_original_scoped(&config.trusted_devices, KeyScope::Machine);
+        if decrypted && store2 {
+            let migrated =
+                encrypt_str_or_original_scoped(&trusted_devices, KeyScope::Machine, 1024 * 1024);
+            if is_scoped_encrypted(migrated.as_bytes()) {
+                config.trusted_devices = migrated;
+                store = true;
+            }
+        }
         if store {
             config.store();
         }
@@ -520,12 +534,22 @@ impl Config2 {
                 .as_ref()
                 .map(|socks| socks.password.as_str())
                 .unwrap_or_default();
-            socks.password =
-                keep_encrypted_storage_if_plaintext_unchanged(&socks.password, stored_password);
+            socks.password = keep_scoped_encrypted_storage_if_plaintext_unchanged(
+                &socks.password,
+                stored_password,
+                KeyScope::Machine,
+                ENCRYPT_MAX_LEN,
+            );
             config.socks = Some(socks);
         }
-        config.unlock_pin =
-            keep_encrypted_storage_if_plaintext_unchanged(&config.unlock_pin, &stored.unlock_pin);
+        config.unlock_pin = keep_scoped_encrypted_storage_if_plaintext_unchanged(
+            &config.unlock_pin,
+            &stored.unlock_pin,
+            KeyScope::Machine,
+            ENCRYPT_MAX_LEN,
+        );
+        config.trusted_devices =
+            trusted_devices_storage_for_store(&config.trusted_devices, &stored.trusted_devices);
         Config::store_(&config, "2");
     }
 
@@ -533,23 +557,109 @@ impl Config2 {
         return CONFIG2.read().unwrap().clone();
     }
 
-    pub fn set(cfg: Config2) -> bool {
+    pub fn get_for_sync() -> Config2 {
+        let mut config = Self::get();
+        let (trusted_devices, decrypted, _) =
+            decrypt_str_or_original_scoped(&config.trusted_devices, KeyScope::Machine);
+        if decrypted {
+            config.trusted_devices = trusted_devices;
+        } else if is_scoped_encrypted(config.trusted_devices.as_bytes()) {
+            crate::throttled_log!(
+                Duration::from_secs(30),
+                error,
+                "Protected trusted-device list cannot be decrypted for config sync"
+            );
+            config.trusted_devices.clear();
+        }
+        config
+    }
+
+    pub fn set(mut cfg: Config2) -> bool {
         let mut lock = CONFIG2.write().unwrap();
+        // get_for_sync uses an empty value only when the source cannot unlock this field;
+        // a deliberate clear is serialized as `[]`.
+        if cfg.trusted_devices.is_empty() && !lock.trusted_devices.is_empty() {
+            cfg.trusted_devices = lock.trusted_devices.clone();
+        }
         if *lock == cfg {
             return false;
         }
+        let trusted_devices_changed = lock.trusted_devices != cfg.trusted_devices;
         *lock = cfg;
         lock.store();
+        drop(lock);
+        if trusted_devices_changed {
+            *TRUSTED_DEVICES.write().unwrap() = Default::default();
+        }
         true
     }
 }
 
-fn keep_encrypted_storage_if_plaintext_unchanged(plain: &str, stored: &str) -> String {
-    let (stored_plain, encrypted, _) = decrypt_str_or_original(stored, PASSWORD_ENC_VERSION);
-    if encrypted && stored_plain == plain {
+fn trusted_devices_storage_for_store(value: &str, stored: &str) -> String {
+    if preserve_stored_value(KeyScope::Machine) {
         return stored.to_owned();
     }
-    encrypt_str_or_original(plain, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN)
+    if is_scoped_encrypted(value.as_bytes()) {
+        return value.to_owned();
+    }
+    if value.starts_with(PASSWORD_ENC_VERSION) {
+        let (plain, encrypted, store_again) =
+            decrypt_str_or_original_scoped(value, KeyScope::Machine);
+        if encrypted && store_again {
+            return encrypt_str_or_original_scoped(&plain, KeyScope::Machine, 1024 * 1024);
+        }
+        if key_provider_registered() {
+            return stored.to_owned();
+        }
+        return value.to_owned();
+    }
+    keep_scoped_encrypted_storage_if_plaintext_unchanged(
+        value,
+        stored,
+        KeyScope::Machine,
+        1024 * 1024,
+    )
+}
+
+fn keep_scoped_encrypted_storage_if_plaintext_unchanged(
+    plain: &str,
+    stored: &str,
+    scope: KeyScope,
+    max_len: usize,
+) -> String {
+    if preserve_stored_value(scope) {
+        return stored.to_owned();
+    }
+    if key_provider_registered() && is_scoped_encrypted(plain.as_bytes()) {
+        return plain.to_owned();
+    }
+    let (stored_plain, encrypted, store_again) = decrypt_str_or_original_scoped(stored, scope);
+    if encrypted && store_again && plain == stored {
+        return encrypt_str_or_original_scoped(&stored_plain, scope, max_len);
+    }
+    if encrypted && !store_again && stored_plain == plain {
+        return stored.to_owned();
+    }
+    encrypt_str_or_original_scoped(plain, scope, max_len)
+}
+
+fn keep_scoped_encrypted_vec_if_plaintext_unchanged(
+    plain: &[u8],
+    stored: &[u8],
+    scope: KeyScope,
+    max_len: usize,
+) -> Vec<u8> {
+    if preserve_stored_value(scope) {
+        return stored.to_owned();
+    }
+    if is_scoped_encrypted(plain) {
+        return plain.to_owned();
+    }
+    let (stored_plain, encrypted, store_again) = decrypt_vec_or_original_scoped(stored, scope);
+    if encrypted && !store_again && stored_plain == plain {
+        return stored.to_owned();
+    }
+    encrypt_vec_or_original_scoped(plain, scope, max_len)
 }
 
 pub fn load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug>(
@@ -609,11 +719,22 @@ impl Config {
     fn load() -> Config {
         let mut config = Config::load_::<Config>("");
         let mut store = false;
-        if let Err(err) = Self::validate_or_decrypt_permanent_password_storage(&mut config) {
-            log::error!("Failed to validate or decrypt permanent password storage: {err}");
+        match Self::validate_or_decrypt_permanent_password_storage(&mut config) {
+            Ok(store2) => store |= store2,
+            Err(err) => {
+                log::error!("Failed to validate or decrypt permanent password storage: {err}")
+            }
         }
         let mut id_valid = false;
-        let (id, encrypted, store2) = decrypt_str_or_original(&config.enc_id, PASSWORD_ENC_VERSION);
+        let (id, encrypted, store2) =
+            decrypt_str_or_original_scoped(&config.enc_id, KeyScope::Machine);
+        if is_scoped_encrypted(config.enc_id.as_bytes()) && !encrypted {
+            log::error!(
+                "Protected device ID cannot be decrypted; preserving the stored ID without regeneration"
+            );
+            config.id_protected_unavailable = true;
+            return config;
+        }
         if encrypted {
             config.id = id;
             id_valid = true;
@@ -627,7 +748,7 @@ impl Config {
         // &&
         !config.id.is_empty()
             && config.enc_id.is_empty()
-            && !decrypt_str_or_original(&config.id, PASSWORD_ENC_VERSION).1
+            && !decrypt_str_or_original_scoped(&config.id, KeyScope::Machine).1
         {
             id_valid = true;
             store = true;
@@ -644,41 +765,49 @@ impl Config {
                 }
             }
         }
+        let (secret_key, _, store2) =
+            decrypt_vec_or_original_scoped(&config.key_pair.0, KeyScope::Machine);
+        config.key_pair.0 = secret_key;
+        store |= store2;
         if store {
             config.store();
         }
         config
     }
 
-    fn validate_or_decrypt_permanent_password_storage(config: &mut Config) -> Result<()> {
+    fn validate_or_decrypt_permanent_password_storage(config: &mut Config) -> Result<bool> {
         if config.password.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         if config.password.starts_with(PASSWORD_ENC_VERSION) {
             let (plain, decrypted, should_store) =
-                decrypt_str_or_original(&config.password, PASSWORD_ENC_VERSION);
+                decrypt_str_or_original_scoped(&config.password, KeyScope::Machine);
             if decrypted {
                 config.password = plain;
-                return Ok(());
+                return Ok(should_store);
             }
             if !should_store {
                 return Err(anyhow!("Invalid permanent password encrypted hash storage"));
             }
-            return Ok(());
+            return Ok(false);
         }
 
-        let (decrypted_storage, decrypted, _) =
+        let (decrypted_storage, decrypted, should_store) =
             decrypt_permanent_password_str_or_original(&config.password);
         if decrypted {
             Self::ensure_permanent_password_hash_salt(config)?;
-            if decode_permanent_password_h1_from_hashed_storage(&decrypted_storage).is_some() {
-                return Ok(());
+            if let Some(h1) = decode_permanent_password_h1_from_hashed_storage(&decrypted_storage) {
+                if should_store {
+                    config.password = encode_permanent_password_encrypted_storage_from_h1(&h1)
+                        .ok_or_else(|| anyhow!("Failed to migrate permanent password storage"))?;
+                }
+                return Ok(should_store);
             }
             return Err(anyhow!("Invalid permanent password encrypted hash storage"));
         }
 
-        Ok(())
+        Ok(false)
     }
 
     fn ensure_permanent_password_hash_salt(config: &Config) -> Result<()> {
@@ -714,22 +843,59 @@ impl Config {
 
     fn store(&self) {
         let mut config = self.clone();
+        let stored = Config::load_::<Config>("");
+        let id_available = Self::try_unlock_protected_id(&mut config);
         Self::prepare_config_for_store(&mut config);
         if !config.password.is_empty()
             && decode_permanent_password_h1_from_storage(&config.password).is_none()
         {
-            let stored = Config::load_::<Config>("");
-            config.password =
-                keep_encrypted_storage_if_plaintext_unchanged(&config.password, &stored.password);
+            config.password = keep_scoped_encrypted_storage_if_plaintext_unchanged(
+                &config.password,
+                &stored.password,
+                KeyScope::Machine,
+                ENCRYPT_MAX_LEN,
+            );
         }
-        let (stored_id, encrypted, _) =
-            decrypt_str_or_original(&config.enc_id, PASSWORD_ENC_VERSION);
-        if !encrypted || stored_id != config.id {
-            config.enc_id =
-                encrypt_str_or_original(&config.id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        if id_available {
+            // Compare with the in-memory ciphertext, as upstream does: the file may lag behind.
+            config.enc_id = keep_scoped_encrypted_storage_if_plaintext_unchanged(
+                &config.id,
+                &self.enc_id,
+                KeyScope::Machine,
+                ENCRYPT_MAX_LEN,
+            );
+        }
+        if key_available(KeyScope::Machine)
+            || key_provider_registered()
+            || is_scoped_encrypted(&config.key_pair.0)
+            || is_scoped_encrypted(&stored.key_pair.0)
+        {
+            config.key_pair.0 = keep_scoped_encrypted_vec_if_plaintext_unchanged(
+                &config.key_pair.0,
+                &stored.key_pair.0,
+                KeyScope::Machine,
+                1024,
+            );
         }
         config.id = "".to_owned();
         Config::store_(&config, "");
+    }
+
+    fn try_unlock_protected_id(config: &mut Config) -> bool {
+        if !config.id_protected_unavailable {
+            if !config.id.is_empty() || !is_scoped_encrypted(config.enc_id.as_bytes()) {
+                return true;
+            }
+            config.id_protected_unavailable = true;
+        }
+        let (id, decrypted, _) = decrypt_str_or_original_scoped(&config.enc_id, KeyScope::Machine);
+        if decrypted {
+            config.id = id;
+            config.id_protected_unavailable = false;
+            true
+        } else {
+            false
+        }
     }
 
     pub fn file() -> PathBuf {
@@ -984,6 +1150,9 @@ impl Config {
 
     pub fn set_id(id: &str) {
         let mut config = CONFIG.write().unwrap();
+        if !Self::try_unlock_protected_id(&mut config) {
+            return;
+        }
         if id == config.id {
             return;
         }
@@ -1121,6 +1290,20 @@ impl Config {
             return p.clone();
         }
         let mut config = Config::load_::<Config>("");
+        let protected_secret_key = is_scoped_encrypted(&config.key_pair.0);
+        if protected_secret_key {
+            let (secret_key, decrypted, _) =
+                decrypt_vec_or_original_scoped(&config.key_pair.0, KeyScope::Machine);
+            if !decrypted {
+                crate::throttled_log!(
+                    Duration::from_secs(30),
+                    error,
+                    "Protected host private key cannot be decrypted"
+                );
+                return (Vec::new(), config.key_pair.1);
+            }
+            config.key_pair.0 = secret_key;
+        }
         if config.key_pair.0.is_empty() {
             log::info!("Generated new keypair for id: {}", config.id);
             let (pk, sk) = sign::gen_keypair();
@@ -1198,7 +1381,12 @@ impl Config {
     }
 
     pub fn get_id() -> String {
-        let mut id = CONFIG.read().unwrap().id.clone();
+        let mut config = CONFIG.write().unwrap();
+        if !Self::try_unlock_protected_id(&mut config) {
+            return String::new();
+        }
+        let mut id = config.id.clone();
+        drop(config);
         if id.is_empty() {
             if let Some(tmp) = Config::gen_id() {
                 id = tmp;
@@ -1599,8 +1787,10 @@ impl Config {
             return devices;
         }
         let devices = CONFIG2.read().unwrap().trusted_devices.clone();
-        let (devices, succ, store) = decrypt_str_or_original(&devices, PASSWORD_ENC_VERSION);
-        if succ {
+        let (decrypted_devices, succ, store) =
+            decrypt_str_or_original_scoped(&devices, KeyScope::Machine);
+        if succ || !is_scoped_encrypted(devices.as_bytes()) && !devices.starts_with("00") {
+            let devices = if succ { decrypted_devices } else { devices };
             let mut devices: Vec<TrustedDevice> =
                 serde_json::from_str(&devices).unwrap_or_default();
             let len = devices.len();
@@ -1623,7 +1813,10 @@ impl Config {
             log::error!("Trusted devices too large: {}", devices.bytes().len());
             return;
         }
-        let devices = encrypt_str_or_original(&devices, PASSWORD_ENC_VERSION, max_len);
+        let devices = encrypt_str_or_original_scoped(&devices, KeyScope::Machine, max_len);
+        if devices.is_empty() {
+            return;
+        }
         let mut config = CONFIG2.write().unwrap();
         config.trusted_devices = devices;
         config.store();
@@ -1653,8 +1846,13 @@ impl Config {
 
     // TODO: `Config::set()` does not invalidate trusted devices when permanent password/salt changes.
     // This matches historical behavior, but may need revisiting in a separate PR.
-    pub fn set(cfg: Config) -> bool {
+    pub fn set(mut cfg: Config) -> bool {
         let mut lock = CONFIG.write().unwrap();
+        if !Self::try_unlock_protected_id(&mut cfg) || !Self::try_unlock_protected_id(&mut lock) {
+            cfg.id.clear();
+            cfg.enc_id = lock.enc_id.clone();
+            cfg.id_protected_unavailable = true;
+        }
         if *lock == cfg {
             return false;
         }
@@ -1706,13 +1904,13 @@ impl PeerConfig {
                 let mut config: PeerConfig = config;
                 let mut store = false;
                 let (password, _, store2) =
-                    decrypt_vec_or_original(&config.password, PASSWORD_ENC_VERSION);
+                    decrypt_vec_or_original_scoped(&config.password, KeyScope::User);
                 config.password = password;
                 store = store || store2;
-                for opt in ["rdp_password", "os-username", "os-password"] {
+                for opt in ["rdp_username", "rdp_password", "os-username", "os-password"] {
                     if let Some(v) = config.options.get_mut(opt) {
                         let (encrypted, _, store2) =
-                            decrypt_str_or_original(v, PASSWORD_ENC_VERSION);
+                            decrypt_str_or_original_scoped(v, KeyScope::User);
                         *v = encrypted;
                         store = store || store2;
                     }
@@ -1741,11 +1939,32 @@ impl PeerConfig {
 
     fn store_(&self, id: &str) {
         let mut config = self.clone();
-        config.password =
-            encrypt_vec_or_original(&config.password, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
-        for opt in ["rdp_password", "os-username", "os-password"] {
+        let stored: PeerConfig = load_path(Self::path(id));
+        config.password = keep_scoped_encrypted_vec_if_plaintext_unchanged(
+            &config.password,
+            &stored.password,
+            KeyScope::User,
+            ENCRYPT_MAX_LEN,
+        );
+        for opt in ["rdp_username", "rdp_password", "os-username", "os-password"] {
             if let Some(v) = config.options.get_mut(opt) {
-                *v = encrypt_str_or_original(v, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN)
+                if opt != "rdp_username"
+                    || key_available(KeyScope::User)
+                    || key_provider_registered()
+                    || is_scoped_encrypted(v.as_bytes())
+                {
+                    let stored_value = stored
+                        .options
+                        .get(opt)
+                        .map(String::as_str)
+                        .unwrap_or_default();
+                    *v = keep_scoped_encrypted_storage_if_plaintext_unchanged(
+                        v,
+                        stored_value,
+                        KeyScope::User,
+                        ENCRYPT_MAX_LEN,
+                    );
+                }
             }
         }
         if let Err(err) = store_path(Self::path(id), config) {
@@ -2140,11 +2359,46 @@ pub struct LocalConfig {
 
 impl LocalConfig {
     fn load() -> LocalConfig {
-        Config::load_::<LocalConfig>("_local")
+        let mut config = Config::load_::<LocalConfig>("_local");
+        let mut store = false;
+        for key in ["access_token", "user_info"] {
+            if let Some(value) = config.options.get_mut(key) {
+                let (plain, _, store2) = decrypt_str_or_original_scoped(value, KeyScope::User);
+                *value = plain;
+                store |= store2;
+            }
+        }
+        if store {
+            config.store();
+        }
+        config
     }
 
     fn store(&self) {
-        Config::store_(self, "_local");
+        let mut config = self.clone();
+        let stored = Config::load_::<LocalConfig>("_local");
+        for key in ["access_token", "user_info"] {
+            if let Some(value) = config.options.get_mut(key) {
+                let stored_value = stored
+                    .options
+                    .get(key)
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                if key_available(KeyScope::User)
+                    || key_provider_registered()
+                    || is_scoped_encrypted(value.as_bytes())
+                    || is_scoped_encrypted(stored_value.as_bytes())
+                {
+                    *value = keep_scoped_encrypted_storage_if_plaintext_unchanged(
+                        value,
+                        stored_value,
+                        KeyScope::User,
+                        1024 * 1024,
+                    );
+                }
+            }
+        }
+        Config::store_(&config, "_local");
     }
 
     pub fn get_kb_layout_type() -> String {
@@ -2539,25 +2793,27 @@ impl Ab {
     }
 
     pub fn store(json: String) {
-        if let Ok(mut file) = std::fs::File::create(Self::path()) {
-            let data = compress(json.as_bytes());
-            let max_len = 64 * 1024 * 1024;
-            if data.len() > max_len {
-                // maxlen of function decompress
-                log::error!("ab data too large, {} > {}", data.len(), max_len);
-                return;
-            }
-            if let Ok(data) = symmetric_crypt(&data, true) {
+        let data = compress(json.as_bytes());
+        let max_len = 64 * 1024 * 1024;
+        if data.len() > max_len {
+            // maxlen of function decompress
+            log::error!("ab data too large, {} > {}", data.len(), max_len);
+            return;
+        }
+        if let Ok(data) = symmetric_crypt_scoped(&data, true, KeyScope::User) {
+            if let Ok(mut file) = std::fs::File::create(Self::path()) {
                 file.write_all(&data).ok();
             }
-        };
+        }
     }
 
     pub fn load() -> Ab {
+        let mut preserve = false;
         if let Ok(mut file) = std::fs::File::open(Self::path()) {
             let mut data = vec![];
             if file.read_to_end(&mut data).is_ok() {
-                if let Ok(data) = symmetric_crypt(&data, false) {
+                preserve = is_scoped_crypt_payload(&data);
+                if let Ok(data) = symmetric_crypt_scoped(&data, false, KeyScope::User) {
                     let data = decompress(&data);
                     if let Ok(ab) = serde_json::from_str::<Ab>(&String::from_utf8_lossy(&data)) {
                         return ab;
@@ -2565,6 +2821,14 @@ impl Ab {
                 }
             }
         };
+        if preserve {
+            crate::throttled_log!(
+                Duration::from_secs(30),
+                error,
+                "Protected address book cannot be decrypted; preserving its file"
+            );
+            return Ab::default();
+        }
         Self::remove();
         Ab::default()
     }
@@ -2669,24 +2933,26 @@ impl Group {
     }
 
     pub fn store(json: String) {
-        if let Ok(mut file) = std::fs::File::create(Self::path()) {
-            let data = compress(json.as_bytes());
-            let max_len = 64 * 1024 * 1024;
-            if data.len() > max_len {
-                // maxlen of function decompress
-                return;
-            }
-            if let Ok(data) = symmetric_crypt(&data, true) {
+        let data = compress(json.as_bytes());
+        let max_len = 64 * 1024 * 1024;
+        if data.len() > max_len {
+            // maxlen of function decompress
+            return;
+        }
+        if let Ok(data) = symmetric_crypt_scoped(&data, true, KeyScope::User) {
+            if let Ok(mut file) = std::fs::File::create(Self::path()) {
                 file.write_all(&data).ok();
             }
-        };
+        }
     }
 
     pub fn load() -> Self {
+        let mut preserve = false;
         if let Ok(mut file) = std::fs::File::open(Self::path()) {
             let mut data = vec![];
             if file.read_to_end(&mut data).is_ok() {
-                if let Ok(data) = symmetric_crypt(&data, false) {
+                preserve = is_scoped_crypt_payload(&data);
+                if let Ok(data) = symmetric_crypt_scoped(&data, false, KeyScope::User) {
                     let data = decompress(&data);
                     if let Ok(group) = serde_json::from_str::<Self>(&String::from_utf8_lossy(&data))
                     {
@@ -2695,6 +2961,14 @@ impl Group {
                 }
             }
         };
+        if preserve {
+            crate::throttled_log!(
+                Duration::from_secs(30),
+                error,
+                "Protected group data cannot be decrypted; preserving its file"
+            );
+            return Self::default();
+        }
         Self::remove();
         Self::default()
     }
@@ -2939,6 +3213,23 @@ impl Status {
 #[cfg(test)]
 mod tests {
     use super::{permanent_password::PERMANENT_PASSWORD_ENC_VERSION, *};
+    use crate::password_security::{decrypt_str_or_original, encrypt_str_or_original};
+
+    struct TestMachineKeyProvider;
+
+    impl crate::password_security::KeyProvider for TestMachineKeyProvider {
+        fn key(&self, _scope: KeyScope) -> Option<[u8; 32]> {
+            Some([0x42; 32])
+        }
+    }
+
+    struct MissingKeyProvider;
+
+    impl crate::password_security::KeyProvider for MissingKeyProvider {
+        fn key(&self, _scope: KeyScope) -> Option<[u8; 32]> {
+            None
+        }
+    }
 
     static CONFIG_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -3000,7 +3291,11 @@ mod tests {
         hard_settings: HashMap<String, String>,
         test: impl FnOnce() -> R,
     ) -> R {
-        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
+        let _guard = CONFIG_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        // The provider is thread-local in tests: one left by a previous test would migrate `00` values.
+        crate::password_security::clear_key_provider();
         let _state_guard = ConfigStateTestGuard::new(config, hard_settings);
         test()
     }
@@ -3222,8 +3517,163 @@ mod tests {
     }
 
     #[test]
+    fn test_store_helpers_preserve_scoped_values_when_provider_key_is_unavailable() {
+        use crate::password_security::{clear_key_provider, set_key_provider};
+        use std::sync::Arc;
+
+        set_key_provider(Arc::new(TestMachineKeyProvider));
+        let stored = encrypt_str_or_original_scoped("secret", KeyScope::Machine, 128);
+        let replacement = encrypt_str_or_original_scoped("replacement", KeyScope::Machine, 128);
+        let stored_vec = encrypt_vec_or_original_scoped(b"secret", KeyScope::Machine, 128);
+        assert_eq!(
+            keep_scoped_encrypted_storage_if_plaintext_unchanged(
+                &stored,
+                &stored,
+                KeyScope::Machine,
+                128,
+            ),
+            stored
+        );
+        set_key_provider(Arc::new(MissingKeyProvider));
+
+        assert_eq!(
+            keep_scoped_encrypted_storage_if_plaintext_unchanged(
+                "changed",
+                &stored,
+                KeyScope::Machine,
+                128,
+            ),
+            stored
+        );
+        assert_eq!(
+            keep_scoped_encrypted_storage_if_plaintext_unchanged(
+                &stored,
+                &stored,
+                KeyScope::Machine,
+                128,
+            ),
+            stored
+        );
+        assert_eq!(
+            keep_scoped_encrypted_storage_if_plaintext_unchanged(
+                &replacement,
+                &stored,
+                KeyScope::Machine,
+                128,
+            ),
+            stored
+        );
+        assert!(keep_scoped_encrypted_storage_if_plaintext_unchanged(
+            &replacement,
+            "",
+            KeyScope::Machine,
+            128,
+        )
+        .is_empty());
+        assert!(keep_scoped_encrypted_storage_if_plaintext_unchanged(
+            "new",
+            "",
+            KeyScope::Machine,
+            128,
+        )
+        .is_empty());
+        assert_eq!(
+            keep_scoped_encrypted_vec_if_plaintext_unchanged(
+                b"changed",
+                &stored_vec,
+                KeyScope::Machine,
+                128,
+            ),
+            stored_vec
+        );
+        assert!(keep_scoped_encrypted_vec_if_plaintext_unchanged(
+            b"new",
+            b"",
+            KeyScope::Machine,
+            128,
+        )
+        .is_empty());
+        clear_key_provider();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_load_migrates_legacy_enc_id_on_store() {
+        use crate::password_security::{clear_key_provider, set_key_provider};
+        use std::sync::Arc;
+
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = Config::file();
+        let _file_guard = ConfigFileRestoreGuard::new(path.clone());
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        clear_key_provider();
+        let id = "123456789";
+        let legacy_id = encrypt_str_or_original(id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        Config::store_(
+            &Config {
+                enc_id: legacy_id,
+                ..Default::default()
+            },
+            "",
+        );
+        set_key_provider(Arc::new(TestMachineKeyProvider));
+
+        let loaded = Config::load();
+        let stored = Config::load_::<Config>("");
+
+        assert_eq!(loaded.id, id);
+        assert!(stored
+            .enc_id
+            .starts_with(crate::password_security::MACHINE_ENC_VERSION));
+        let (stored_id, decrypted, store_again) =
+            decrypt_str_or_original_scoped(&stored.enc_id, KeyScope::Machine);
+        assert_eq!(stored_id, id);
+        assert!(decrypted);
+        assert!(!store_again);
+        clear_key_provider();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_get_id_and_store_preserve_locked_protected_id() {
+        use crate::password_security::{clear_key_provider, set_key_provider};
+        use std::sync::Arc;
+
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = Config::file();
+        let _file_guard = ConfigFileRestoreGuard::new(path.clone());
+        let _state_guard = ConfigStateTestGuard::new(Config::default(), HashMap::new());
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        set_key_provider(Arc::new(TestMachineKeyProvider));
+        let protected_id =
+            encrypt_str_or_original_scoped("123456789", KeyScope::Machine, ENCRYPT_MAX_LEN);
+        clear_key_provider();
+        let config = Config {
+            enc_id: protected_id.clone(),
+            ..Default::default()
+        };
+        Config::store_(&config, "");
+        let loaded = Config::load();
+        assert!(loaded.id_protected_unavailable);
+        *CONFIG.write().unwrap() = loaded;
+
+        assert!(Config::get_id().is_empty());
+        Config::set_id("987654321");
+        Config::set_key_confirmed(true);
+
+        let stored = Config::load_::<Config>("");
+        assert_eq!(stored.enc_id.as_bytes(), protected_id.as_bytes());
+        assert!(stored.id.is_empty());
+        assert!(stored.key_confirmed);
+    }
+
+    #[test]
     fn test_config2_store_keeps_existing_unlock_pin_when_pin_is_unchanged() {
-        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let _file_guard = ConfigFileRestoreGuard::new(Config::file_("2"));
         let pin = "123456";
         let original_unlock_pin =
@@ -3243,6 +3693,110 @@ mod tests {
 
         let stored = Config::load_::<Config2>("2");
         assert_eq!(stored.unlock_pin, original_unlock_pin);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_config2_store_preserves_legacy_trusted_devices_without_provider() {
+        use crate::password_security::clear_key_provider;
+        use std::cell::Cell;
+
+        struct DuplicateEncryptionLogger;
+
+        std::thread_local! {
+            static DUPLICATE_ENCRYPTION_LOGGED: Cell<bool> = const { Cell::new(false) };
+        }
+
+        impl log::Log for DuplicateEncryptionLogger {
+            fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+                true
+            }
+
+            fn log(&self, record: &log::Record<'_>) {
+                if record.args().to_string() == "Duplicate encryption!" {
+                    DUPLICATE_ENCRYPTION_LOGGED.with(|logged| logged.set(true));
+                }
+            }
+
+            fn flush(&self) {}
+        }
+
+        static LOGGER: DuplicateEncryptionLogger = DuplicateEncryptionLogger;
+
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = Config::file_("2");
+        let _file_guard = ConfigFileRestoreGuard::new(path.clone());
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        clear_key_provider();
+        let plain = r#"[{"id":"legacy"}]"#;
+        let legacy = encrypt_str_or_original(plain, PASSWORD_ENC_VERSION, 1024 * 1024);
+        assert!(legacy.starts_with(PASSWORD_ENC_VERSION));
+        Config::store_(
+            &Config2 {
+                trusted_devices: legacy.clone(),
+                ..Default::default()
+            },
+            "2",
+        );
+        let _ = log::set_logger(&LOGGER);
+        log::set_max_level(log::LevelFilter::Error);
+
+        Config2 {
+            trusted_devices: legacy.clone(),
+            ..Default::default()
+        }
+        .store();
+
+        let stored = Config::load_::<Config2>("2");
+        assert_eq!(stored.trusted_devices, legacy);
+        assert!(!DUPLICATE_ENCRYPTION_LOGGED.with(Cell::get));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_config2_store_never_downgrades_stale_legacy_trusted_devices() {
+        use crate::password_security::{clear_key_provider, set_key_provider};
+        use std::sync::Arc;
+
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = Config::file_("2");
+        let _file_guard = ConfigFileRestoreGuard::new(path.clone());
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        clear_key_provider();
+        let plain = r#"[{"id":"legacy"}]"#;
+        let legacy = encrypt_str_or_original(plain, PASSWORD_ENC_VERSION, 1024 * 1024);
+        Config::store_(
+            &Config2 {
+                trusted_devices: legacy.clone(),
+                ..Default::default()
+            },
+            "2",
+        );
+        set_key_provider(Arc::new(TestMachineKeyProvider));
+
+        let loaded = Config2::load();
+        assert!(is_scoped_encrypted(loaded.trusted_devices.as_bytes()));
+        Config2 {
+            trusted_devices: legacy,
+            ..Default::default()
+        }
+        .store();
+
+        let stored = Config::load_::<Config2>("2");
+        assert!(stored
+            .trusted_devices
+            .starts_with(crate::password_security::MACHINE_ENC_VERSION));
+        assert!(!stored.trusted_devices.starts_with(PASSWORD_ENC_VERSION));
+        let (decrypted, success, store_again) =
+            decrypt_str_or_original_scoped(&stored.trusted_devices, KeyScope::Machine);
+        assert_eq!(decrypted, plain);
+        assert!(success);
+        assert!(!store_again);
+        clear_key_provider();
     }
 
     #[test]

@@ -1,6 +1,9 @@
 use crate::config::Config;
 use sodiumoxide::{base64, crypto::secretbox};
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, RwLock,
+};
 
 lazy_static::lazy_static! {
     pub static ref TEMPORARY_PASSWORD:Arc<RwLock<String>> = Arc::new(RwLock::new(get_auto_password()));
@@ -93,6 +96,119 @@ pub fn hide_cm() -> bool {
 
 const VERSION_LEN: usize = 2;
 const FORMAT_V1: u8 = 1;
+pub const MACHINE_ENC_VERSION: &str = "02";
+pub const USER_ENC_VERSION: &str = "03";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyScope {
+    Machine,
+    User,
+}
+
+impl KeyScope {
+    fn version(self) -> &'static str {
+        match self {
+            Self::Machine => MACHINE_ENC_VERSION,
+            Self::User => USER_ENC_VERSION,
+        }
+    }
+
+    fn from_version(version: &str) -> Option<Self> {
+        match version {
+            MACHINE_ENC_VERSION => Some(Self::Machine),
+            USER_ENC_VERSION => Some(Self::User),
+            _ => None,
+        }
+    }
+}
+
+pub trait KeyProvider: Send + Sync {
+    fn key(&self, scope: KeyScope) -> Option<[u8; secretbox::KEYBYTES]>;
+}
+
+static MACHINE_KEY_UNAVAILABLE_LOGGED: AtomicBool = AtomicBool::new(false);
+static USER_KEY_UNAVAILABLE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(not(test))]
+lazy_static::lazy_static! {
+    static ref KEY_PROVIDER: RwLock<Option<Arc<dyn KeyProvider>>> = RwLock::new(None);
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_KEY_PROVIDER: std::cell::RefCell<Option<Arc<dyn KeyProvider>>> = Default::default();
+}
+
+#[cfg(test)]
+pub fn set_key_provider(provider: Arc<dyn KeyProvider>) {
+    TEST_KEY_PROVIDER.with(|slot| *slot.borrow_mut() = Some(provider));
+}
+
+#[cfg(not(test))]
+pub fn set_key_provider(provider: Arc<dyn KeyProvider>) {
+    *KEY_PROVIDER.write().unwrap() = Some(provider);
+}
+
+#[cfg(test)]
+fn scoped_key(scope: KeyScope) -> Option<secretbox::Key> {
+    TEST_KEY_PROVIDER.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|provider| provider.key(scope))
+            .map(secretbox::Key)
+    })
+}
+
+#[cfg(not(test))]
+fn scoped_key(scope: KeyScope) -> Option<secretbox::Key> {
+    KEY_PROVIDER
+        .read()
+        .unwrap()
+        .as_ref()
+        .and_then(|provider| provider.key(scope))
+        .map(secretbox::Key)
+}
+
+pub fn key_available(scope: KeyScope) -> bool {
+    scoped_key(scope).is_some()
+}
+
+#[cfg(test)]
+pub fn key_provider_registered() -> bool {
+    TEST_KEY_PROVIDER.with(|slot| slot.borrow().is_some())
+}
+
+#[cfg(not(test))]
+pub fn key_provider_registered() -> bool {
+    KEY_PROVIDER.read().unwrap().is_some()
+}
+
+fn log_key_unavailable(scope: KeyScope) {
+    let logged = match scope {
+        KeyScope::Machine => &MACHINE_KEY_UNAVAILABLE_LOGGED,
+        KeyScope::User => &USER_KEY_UNAVAILABLE_LOGGED,
+    };
+    if !logged.swap(true, Ordering::Relaxed) {
+        log::error!(
+            "Credential key for {:?} scope is unavailable; protected values will not be saved",
+            scope
+        );
+    }
+}
+
+pub(crate) fn preserve_stored_value(scope: KeyScope) -> bool {
+    if key_provider_registered() && !key_available(scope) {
+        log_key_unavailable(scope);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn clear_key_provider() {
+    TEST_KEY_PROVIDER.with(|slot| *slot.borrow_mut() = None);
+}
 
 // Check if data is already encrypted by verifying:
 // 1) version prefix "00"
@@ -112,6 +228,26 @@ fn is_encrypted(v: &[u8]) -> bool {
         Ok(decoded) => decoded.len() >= sodiumoxide::crypto::secretbox::MACBYTES,
         Err(_) => false,
     }
+}
+
+pub fn is_scoped_crypt_payload(v: &[u8]) -> bool {
+    v.len() > VERSION_LEN
+        && (v.starts_with(MACHINE_ENC_VERSION.as_bytes())
+            || v.starts_with(USER_ENC_VERSION.as_bytes()))
+}
+
+pub fn is_scoped_encrypted(v: &[u8]) -> bool {
+    if !is_scoped_crypt_payload(v) {
+        return false;
+    }
+    match base64::decode(&v[VERSION_LEN..], base64::Variant::Original) {
+        Ok(decoded) => decoded.len() >= secretbox::MACBYTES,
+        Err(_) => false,
+    }
+}
+
+fn is_any_encrypted(v: &[u8]) -> bool {
+    is_encrypted(v) || is_scoped_encrypted(v)
 }
 
 pub fn encrypt_str_or_original(s: &str, version: &str, max_len: usize) -> String {
@@ -193,6 +329,129 @@ pub fn decrypt_vec_or_original(v: &[u8], current_version: &str) -> (Vec<u8>, boo
     (v.to_owned(), false, !v.is_empty() && !is_encrypted(v))
 }
 
+pub fn encrypt_str_or_original_scoped(s: &str, scope: KeyScope, max_len: usize) -> String {
+    if is_scoped_encrypted(s.as_bytes()) {
+        return s.to_owned();
+    }
+    if is_encrypted(s.as_bytes()) {
+        log::error!("Duplicate encryption!");
+        return s.to_owned();
+    }
+    if s.chars().count() > max_len {
+        return String::default();
+    }
+    match encrypt_scoped_payload(s.as_bytes(), scope) {
+        Ok(encrypted) => {
+            scope.version().to_owned() + &base64::encode(encrypted, base64::Variant::Original)
+        }
+        Err(_) if !key_provider_registered() => encrypt_str_or_original(s, "00", max_len),
+        Err(_) => String::new(),
+    }
+}
+
+pub fn decrypt_str_or_original_scoped(s: &str, scope: KeyScope) -> (String, bool, bool) {
+    let (decrypted, success, store) = decrypt_bytes_or_original_scoped(s.as_bytes(), scope);
+    (
+        String::from_utf8_lossy(&decrypted).to_string(),
+        success,
+        store,
+    )
+}
+
+pub fn encrypt_vec_or_original_scoped(v: &[u8], scope: KeyScope, max_len: usize) -> Vec<u8> {
+    if is_scoped_encrypted(v) {
+        return v.to_owned();
+    }
+    if is_encrypted(v) {
+        log::error!("Duplicate encryption!");
+        return v.to_owned();
+    }
+    if v.len() > max_len {
+        return vec![];
+    }
+    match encrypt_scoped_payload(v, scope) {
+        Ok(encrypted) => {
+            let mut output = scope.version().as_bytes().to_vec();
+            output.extend(base64::encode(encrypted, base64::Variant::Original).as_bytes());
+            output
+        }
+        Err(_) if !key_provider_registered() => encrypt_vec_or_original(v, "00", max_len),
+        Err(_) => Vec::new(),
+    }
+}
+
+pub fn decrypt_vec_or_original_scoped(v: &[u8], scope: KeyScope) -> (Vec<u8>, bool, bool) {
+    decrypt_bytes_or_original_scoped(v, scope)
+}
+
+fn decrypt_bytes_or_original_scoped(v: &[u8], scope: KeyScope) -> (Vec<u8>, bool, bool) {
+    if v.len() > VERSION_LEN {
+        let version = String::from_utf8_lossy(&v[..VERSION_LEN]);
+        if let Some(stored_scope) = KeyScope::from_version(&version) {
+            if let Some(key) = scoped_key(stored_scope) {
+                if let Ok(decoded) = base64::decode(&v[VERSION_LEN..], base64::Variant::Original) {
+                    if let Ok(decrypted) = open_secretbox_payload(&decoded, &key) {
+                        return (decrypted, true, stored_scope != scope);
+                    }
+                }
+            }
+            return (v.to_owned(), false, false);
+        }
+        if version == "00" {
+            if let Ok(decrypted) = decrypt(&v[VERSION_LEN..]) {
+                return (decrypted, true, scoped_key(scope).is_some());
+            }
+            return (v.to_owned(), false, false);
+        }
+    }
+    (
+        v.to_owned(),
+        false,
+        !v.is_empty() && !is_any_encrypted(v) && key_available(scope),
+    )
+}
+
+pub fn symmetric_crypt_scoped(data: &[u8], encrypt: bool, scope: KeyScope) -> Result<Vec<u8>, ()> {
+    if encrypt {
+        return match encrypt_scoped_payload(data, scope) {
+            Ok(encrypted) => {
+                let mut output = scope.version().as_bytes().to_vec();
+                output.extend(encrypted);
+                Ok(output)
+            }
+            Err(_) if !key_provider_registered() => symmetric_crypt(data, true),
+            Err(_) => Err(()),
+        };
+    }
+
+    if data.len() > VERSION_LEN {
+        let version = String::from_utf8_lossy(&data[..VERSION_LEN]);
+        if let Some(stored_scope) = KeyScope::from_version(&version) {
+            if let Some(key) = scoped_key(stored_scope) {
+                if let Ok(decrypted) = open_secretbox_payload(&data[VERSION_LEN..], &key) {
+                    return Ok(decrypted);
+                }
+            }
+        }
+    }
+    symmetric_crypt(data, false)
+}
+
+pub fn encrypt_scoped_payload(data: &[u8], scope: KeyScope) -> Result<Vec<u8>, ()> {
+    let key = scoped_key(scope).ok_or_else(|| {
+        if key_provider_registered() {
+            log_key_unavailable(scope);
+        }
+    })?;
+    let nonce = secretbox::gen_nonce();
+    let encrypted = secretbox::seal(data, &nonce, &key);
+    let mut output = Vec::with_capacity(1 + nonce.0.len() + encrypted.len());
+    output.push(FORMAT_V1);
+    output.extend(nonce.0);
+    output.extend(encrypted);
+    Ok(output)
+}
+
 fn encrypt(v: &[u8]) -> Result<String, ()> {
     if !v.is_empty() {
         symmetric_crypt(v, true).map(|v| base64::encode(v, base64::Variant::Original))
@@ -262,6 +521,27 @@ fn open_secretbox_payload(data: &[u8], key: &secretbox::Key) -> Result<Vec<u8>, 
 }
 
 mod test {
+
+    #[cfg(test)]
+    struct TestKeyProvider;
+
+    #[cfg(test)]
+    impl super::KeyProvider for TestKeyProvider {
+        fn key(&self, scope: super::KeyScope) -> Option<[u8; 32]> {
+            Some(match scope {
+                super::KeyScope::Machine => [0x22; 32],
+                super::KeyScope::User => [0x33; 32],
+            })
+        }
+    }
+
+    struct MissingKeyProvider;
+
+    impl super::KeyProvider for MissingKeyProvider {
+        fn key(&self, _scope: super::KeyScope) -> Option<[u8; 32]> {
+            None
+        }
+    }
 
     #[test]
     fn test() {
@@ -647,5 +927,81 @@ mod test {
         assert_eq!(decrypted, data);
         assert!(success);
         assert!(!store);
+    }
+
+    #[test]
+    fn test_scoped_formats_roundtrip() {
+        use super::*;
+
+        set_key_provider(Arc::new(TestKeyProvider));
+        for (scope, prefix) in [
+            (KeyScope::Machine, MACHINE_ENC_VERSION),
+            (KeyScope::User, USER_ENC_VERSION),
+        ] {
+            let encrypted = encrypt_str_or_original_scoped("secret", scope, 128);
+            assert!(encrypted.starts_with(prefix));
+            let (plain, decrypted, store_again) = decrypt_str_or_original_scoped(&encrypted, scope);
+            assert_eq!(plain, "secret");
+            assert!(decrypted);
+            assert!(!store_again);
+
+            let encrypted = encrypt_vec_or_original_scoped(b"secret", scope, 128);
+            assert!(encrypted.starts_with(prefix.as_bytes()));
+            let (plain, decrypted, store_again) = decrypt_vec_or_original_scoped(&encrypted, scope);
+            assert_eq!(plain, b"secret");
+            assert!(decrypted);
+            assert!(!store_again);
+        }
+        clear_key_provider();
+    }
+
+    #[test]
+    fn test_legacy_00_requests_scoped_migration() {
+        use super::*;
+
+        clear_key_provider();
+        let legacy = encrypt_str_or_original("secret", "00", 128);
+        set_key_provider(Arc::new(TestKeyProvider));
+        let (plain, decrypted, store_again) =
+            decrypt_str_or_original_scoped(&legacy, KeyScope::User);
+        assert_eq!(plain, "secret");
+        assert!(decrypted);
+        assert!(store_again);
+        assert!(encrypt_str_or_original_scoped(&plain, KeyScope::User, 128)
+            .starts_with(USER_ENC_VERSION));
+
+        clear_key_provider();
+        let legacy_file = symmetric_crypt(b"address book", true).unwrap();
+        set_key_provider(Arc::new(TestKeyProvider));
+        assert_eq!(
+            symmetric_crypt_scoped(&legacy_file, false, KeyScope::User).unwrap(),
+            b"address book"
+        );
+        clear_key_provider();
+    }
+
+    #[test]
+    fn test_scoped_api_without_provider_keeps_upstream_format() {
+        use super::*;
+
+        clear_key_provider();
+        let encrypted = encrypt_str_or_original_scoped("secret", KeyScope::Machine, 128);
+        assert!(encrypted.starts_with("00"));
+        let (plain, decrypted, store_again) = decrypt_str_or_original(&encrypted, "00");
+        assert_eq!(plain, "secret");
+        assert!(decrypted);
+        assert!(!store_again);
+    }
+
+    #[test]
+    fn test_scoped_api_does_not_downgrade_when_provider_key_is_unavailable() {
+        use super::*;
+
+        set_key_provider(Arc::new(MissingKeyProvider));
+        assert!(key_provider_registered());
+        assert!(encrypt_str_or_original_scoped("secret", KeyScope::Machine, 128).is_empty());
+        assert!(encrypt_vec_or_original_scoped(b"secret", KeyScope::User, 128).is_empty());
+        assert!(symmetric_crypt_scoped(b"secret", true, KeyScope::Machine).is_err());
+        clear_key_provider();
     }
 }

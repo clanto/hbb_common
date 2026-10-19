@@ -3,7 +3,11 @@ use sodiumoxide::base64;
 
 use crate::{
     log,
-    password_security::{decrypt_str_or_original, symmetric_crypt},
+    password_security::{
+        decrypt_str_or_original, decrypt_str_or_original_scoped, encrypt_scoped_payload,
+        is_scoped_encrypted, key_available, key_provider_registered, symmetric_crypt, KeyScope,
+        MACHINE_ENC_VERSION,
+    },
 };
 
 pub(super) const PASSWORD_ENC_VERSION: &str = "00";
@@ -75,6 +79,14 @@ fn encrypt_permanent_password_storage(storage: &str) -> Option<String> {
     if storage.chars().count() > ENCRYPT_MAX_LEN {
         return None;
     }
+    if let Ok(encrypted) = encrypt_scoped_payload(storage.as_bytes(), KeyScope::Machine) {
+        return Some(
+            MACHINE_ENC_VERSION.to_owned() + &base64::encode(encrypted, base64::Variant::Original),
+        );
+    }
+    if key_provider_registered() {
+        return None;
+    }
     let encrypted = symmetric_crypt(storage.as_bytes(), true).ok()?;
     Some(
         PERMANENT_PASSWORD_ENC_VERSION.to_owned()
@@ -83,13 +95,20 @@ fn encrypt_permanent_password_storage(storage: &str) -> Option<String> {
 }
 
 pub(super) fn decrypt_permanent_password_str_or_original(storage: &str) -> (String, bool, bool) {
+    if key_provider_registered() && is_scoped_encrypted(storage.as_bytes()) {
+        return decrypt_str_or_original_scoped(storage, KeyScope::Machine);
+    }
     if storage.len() > VERSION_LEN && storage.starts_with(PERMANENT_PASSWORD_ENC_VERSION) {
         if let Ok(decoded) = base64::decode(
             &storage.as_bytes()[VERSION_LEN..],
             base64::Variant::Original,
         ) {
             if let Ok(v) = symmetric_crypt(&decoded, false) {
-                return (String::from_utf8_lossy(&v).to_string(), true, false);
+                return (
+                    String::from_utf8_lossy(&v).to_string(),
+                    true,
+                    key_available(KeyScope::Machine),
+                );
             }
         }
     }
@@ -103,6 +122,13 @@ pub fn local_permanent_password_storage_is_usable_for_auth(storage: &str, salt: 
 
     if decode_permanent_password_h1_from_storage(storage).is_some() {
         return !salt.is_empty();
+    }
+    if key_provider_registered() && is_scoped_encrypted(storage.as_bytes()) {
+        let (_, decrypted, _) = decrypt_permanent_password_str_or_original(storage);
+        if decrypted {
+            log::error!("Permanent password storage looks current but cannot be decoded as a hash");
+        }
+        return false;
     }
     if storage.starts_with(PERMANENT_PASSWORD_ENC_VERSION) {
         let (_, decrypted, _) = decrypt_permanent_password_str_or_original(storage);
@@ -177,7 +203,9 @@ pub(super) fn preset_permanent_password_storage_matches_plain(
 pub fn decode_permanent_password_h1_from_storage(
     storage: &str,
 ) -> Option<[u8; PERMANENT_PASSWORD_H1_LEN]> {
-    if storage.starts_with(PERMANENT_PASSWORD_ENC_VERSION) {
+    if storage.starts_with(PERMANENT_PASSWORD_ENC_VERSION)
+        || (key_provider_registered() && is_scoped_encrypted(storage.as_bytes()))
+    {
         let (hashed_storage, decrypted, _) = decrypt_permanent_password_str_or_original(storage);
         if !decrypted {
             return None;
@@ -196,7 +224,9 @@ pub(super) fn password_is_empty_or_not_hashed(permanent_password_storage: &str) 
     if decode_permanent_password_h1_from_storage(permanent_password_storage).is_some() {
         return false;
     }
-    if permanent_password_storage.starts_with(PERMANENT_PASSWORD_ENC_VERSION) {
+    if permanent_password_storage.starts_with(PERMANENT_PASSWORD_ENC_VERSION)
+        || (key_provider_registered() && is_scoped_encrypted(permanent_password_storage.as_bytes()))
+    {
         return false;
     }
     let (_, decrypted, looks_like_plaintext) =
@@ -207,7 +237,19 @@ pub(super) fn password_is_empty_or_not_hashed(permanent_password_storage: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::password_security::encrypt_str_or_original;
+    use crate::password_security::{
+        clear_key_provider, encrypt_str_or_original, set_key_provider, KeyProvider,
+        MACHINE_ENC_VERSION, USER_ENC_VERSION,
+    };
+    use std::sync::Arc;
+
+    struct MachineKeyProvider;
+
+    impl KeyProvider for MachineKeyProvider {
+        fn key(&self, _scope: KeyScope) -> Option<[u8; 32]> {
+            Some([0x24; 32])
+        }
+    }
 
     fn encode_hbbs_preset_password_storage_from_h1(h1: &[u8; PERMANENT_PASSWORD_H1_LEN]) -> String {
         HBBS_PRESET_PASSWORD_HASH_PREFIX.to_owned() + &base64::encode(h1, base64::Variant::Original)
@@ -241,6 +283,20 @@ mod tests {
             decode_permanent_password_h1_from_storage(&storage),
             Some(h1)
         );
+    }
+
+    #[test]
+    fn test_permanent_password_uses_machine_scope_when_provider_is_registered() {
+        set_key_provider(Arc::new(MachineKeyProvider));
+        let h1 = compute_permanent_password_h1("p@ssw0rd", "salt123");
+        let storage = encode_permanent_password_encrypted_storage_from_h1(&h1).unwrap();
+
+        assert!(storage.starts_with(MACHINE_ENC_VERSION));
+        assert_eq!(
+            decode_permanent_password_h1_from_storage(&storage),
+            Some(h1)
+        );
+        clear_key_provider();
     }
 
     #[test]
@@ -340,6 +396,38 @@ mod tests {
             "",
             "01not-a-valid-hash"
         ));
+    }
+
+    #[test]
+    fn test_local_plain_password_starting_with_01_keeps_upstream_behavior_without_provider() {
+        clear_key_provider();
+        assert!(local_permanent_password_storage_is_usable_for_auth(
+            "01234567", ""
+        ));
+        assert!(local_permanent_password_storage_matches_plain(
+            "01234567", "", "01234567"
+        ));
+    }
+
+    #[test]
+    fn test_plain_password_with_scoped_prefix_keeps_upstream_behavior_without_provider() {
+        clear_key_provider();
+        let payload = base64::encode(
+            vec![0x42; sodiumoxide::crypto::secretbox::MACBYTES + 8],
+            base64::Variant::Original,
+        );
+        for prefix in [MACHINE_ENC_VERSION, USER_ENC_VERSION] {
+            let storage = prefix.to_owned() + &payload;
+            assert!(is_scoped_encrypted(storage.as_bytes()));
+            assert!(local_permanent_password_storage_is_usable_for_auth(
+                &storage, ""
+            ));
+            assert_eq!(decode_permanent_password_h1_from_storage(&storage), None);
+            assert!(local_permanent_password_storage_matches_plain(
+                &storage, "", &storage
+            ));
+            assert!(password_is_empty_or_not_hashed(&storage));
+        }
     }
 
     #[test]
