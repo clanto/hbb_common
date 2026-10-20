@@ -495,14 +495,22 @@ impl Config2 {
         let mut config = Config::load_::<Config2>("2");
         let mut store = false;
         if let Some(mut socks) = config.socks {
-            let (password, _, store2) =
-                decrypt_str_or_original_scoped(&socks.password, KeyScope::Machine);
+            let (password, _, store2) = decrypt_secret_or_empty_scoped(
+                socks.password.as_bytes(),
+                KeyScope::Machine,
+                "socks.password",
+                |plain| String::from_utf8_lossy(&plain).into_owned(),
+            );
             socks.password = password;
             config.socks = Some(socks);
             store |= store2;
         }
-        let (unlock_pin, _, store2) =
-            decrypt_str_or_original_scoped(&config.unlock_pin, KeyScope::Machine);
+        let (unlock_pin, _, store2) = decrypt_secret_or_empty_scoped(
+            config.unlock_pin.as_bytes(),
+            KeyScope::Machine,
+            "unlock_pin",
+            |plain| String::from_utf8_lossy(&plain).into_owned(),
+        );
         config.unlock_pin = unlock_pin;
         store |= store2;
         let (trusted_devices, decrypted, store2) =
@@ -595,6 +603,25 @@ impl Config2 {
     }
 }
 
+fn decrypt_secret_or_empty_scoped<T: Default>(
+    value: &[u8],
+    scope: KeyScope,
+    field: &str,
+    decode: impl FnOnce(Vec<u8>) -> T,
+) -> (T, bool, bool) {
+    let (plain, decrypted, store_again) = decrypt_vec_or_original_scoped(value, scope);
+    if !decrypted && is_scoped_crypt_payload(value) {
+        crate::throttled_log!(
+            Duration::from_secs(30),
+            error,
+            "Protected config field '{}' cannot be decrypted; using an empty in-memory value",
+            field
+        );
+        return (T::default(), false, false);
+    }
+    (decode(plain), decrypted, store_again)
+}
+
 fn trusted_devices_storage_for_store(value: &str, stored: &str) -> String {
     if preserve_stored_value(KeyScope::Machine) {
         return stored.to_owned();
@@ -634,6 +661,9 @@ fn keep_scoped_encrypted_storage_if_plaintext_unchanged(
         return plain.to_owned();
     }
     let (stored_plain, encrypted, store_again) = decrypt_str_or_original_scoped(stored, scope);
+    if plain.is_empty() && is_scoped_crypt_payload(stored.as_bytes()) && !encrypted {
+        return stored.to_owned();
+    }
     if encrypted && store_again && plain == stored {
         return encrypt_str_or_original_scoped(&stored_plain, scope, max_len);
     }
@@ -656,6 +686,9 @@ fn keep_scoped_encrypted_vec_if_plaintext_unchanged(
         return plain.to_owned();
     }
     let (stored_plain, encrypted, store_again) = decrypt_vec_or_original_scoped(stored, scope);
+    if plain.is_empty() && is_scoped_crypt_payload(stored) && !encrypted {
+        return stored.to_owned();
+    }
     if encrypted && !store_again && stored_plain == plain {
         return stored.to_owned();
     }
@@ -765,8 +798,12 @@ impl Config {
                 }
             }
         }
-        let (secret_key, _, store2) =
-            decrypt_vec_or_original_scoped(&config.key_pair.0, KeyScope::Machine);
+        let (secret_key, _, store2) = decrypt_secret_or_empty_scoped(
+            &config.key_pair.0,
+            KeyScope::Machine,
+            "key_pair.0",
+            |plain| plain,
+        );
         config.key_pair.0 = secret_key;
         store |= store2;
         if store {
@@ -867,8 +904,8 @@ impl Config {
         }
         if key_available(KeyScope::Machine)
             || key_provider_registered()
-            || is_scoped_encrypted(&config.key_pair.0)
-            || is_scoped_encrypted(&stored.key_pair.0)
+            || is_scoped_crypt_payload(&config.key_pair.0)
+            || is_scoped_crypt_payload(&stored.key_pair.0)
         {
             config.key_pair.0 = keep_scoped_encrypted_vec_if_plaintext_unchanged(
                 &config.key_pair.0,
@@ -1290,7 +1327,7 @@ impl Config {
             return p.clone();
         }
         let mut config = Config::load_::<Config>("");
-        let protected_secret_key = is_scoped_encrypted(&config.key_pair.0);
+        let protected_secret_key = is_scoped_crypt_payload(&config.key_pair.0);
         if protected_secret_key {
             let (secret_key, decrypted, _) =
                 decrypt_vec_or_original_scoped(&config.key_pair.0, KeyScope::Machine);
@@ -1332,10 +1369,22 @@ impl Config {
         }
 
         // IMPORTANT: this path is called while holding KEY_PAIR lock.
-        // Config::load_ must remain a raw conf load/deserialize path and must never
-        // call decrypt_* / symmetric_crypt (directly or indirectly), otherwise this
-        // can re-enter key loading and deadlock.
-        let config = Config::load_::<Config>("");
+        // Config::load_ must remain a raw conf load/deserialize path. Scoped payloads
+        // can be opened directly without the legacy symmetric_crypt fallback that
+        // re-enters this function while KEY_PAIR is locked.
+        let mut config = Config::load_::<Config>("");
+        if is_scoped_crypt_payload(&config.key_pair.0) {
+            let (secret_key, decrypted, _) = decrypt_secret_or_empty_scoped(
+                &config.key_pair.0,
+                KeyScope::Machine,
+                "key_pair.0",
+                |plain| plain,
+            );
+            if !decrypted {
+                return None;
+            }
+            config.key_pair.0 = secret_key;
+        }
         if !config.key_pair.0.is_empty() {
             *lock = Some(config.key_pair.clone());
             Some(config.key_pair)
@@ -1903,15 +1952,23 @@ impl PeerConfig {
             Ok(config) => {
                 let mut config: PeerConfig = config;
                 let mut store = false;
-                let (password, _, store2) =
-                    decrypt_vec_or_original_scoped(&config.password, KeyScope::User);
+                let (password, _, store2) = decrypt_secret_or_empty_scoped(
+                    &config.password,
+                    KeyScope::User,
+                    "peer.password",
+                    |plain| plain,
+                );
                 config.password = password;
                 store = store || store2;
                 for opt in ["rdp_username", "rdp_password", "os-username", "os-password"] {
                     if let Some(v) = config.options.get_mut(opt) {
-                        let (encrypted, _, store2) =
-                            decrypt_str_or_original_scoped(v, KeyScope::User);
-                        *v = encrypted;
+                        let (plain, _, store2) = decrypt_secret_or_empty_scoped(
+                            v.as_bytes(),
+                            KeyScope::User,
+                            opt,
+                            |plain| String::from_utf8_lossy(&plain).into_owned(),
+                        );
+                        *v = plain;
                         store = store || store2;
                     }
                 }
@@ -2363,7 +2420,12 @@ impl LocalConfig {
         let mut store = false;
         for key in ["access_token", "user_info"] {
             if let Some(value) = config.options.get_mut(key) {
-                let (plain, _, store2) = decrypt_str_or_original_scoped(value, KeyScope::User);
+                let (plain, _, store2) = decrypt_secret_or_empty_scoped(
+                    value.as_bytes(),
+                    KeyScope::User,
+                    key,
+                    |plain| String::from_utf8_lossy(&plain).into_owned(),
+                );
                 *value = plain;
                 store |= store2;
             }
@@ -3223,6 +3285,14 @@ mod tests {
         }
     }
 
+    struct AlternateKeyProvider;
+
+    impl crate::password_security::KeyProvider for AlternateKeyProvider {
+        fn key(&self, _scope: KeyScope) -> Option<[u8; 32]> {
+            Some([0x24; 32])
+        }
+    }
+
     struct MissingKeyProvider;
 
     impl crate::password_security::KeyProvider for MissingKeyProvider {
@@ -3241,6 +3311,14 @@ mod tests {
     struct ConfigFileRestoreGuard {
         path: PathBuf,
         original_content: Option<Vec<u8>>,
+    }
+
+    struct Config2StateTestGuard {
+        original_config: Config2,
+    }
+
+    struct KeyPairCacheTestGuard {
+        original_key_pair: Option<KeyPair>,
     }
 
     impl ConfigStateTestGuard {
@@ -3283,6 +3361,34 @@ mod tests {
             } else {
                 fs::remove_file(&self.path).ok();
             }
+        }
+    }
+
+    impl Config2StateTestGuard {
+        fn new() -> Self {
+            Self {
+                original_config: CONFIG2.read().unwrap().clone(),
+            }
+        }
+    }
+
+    impl Drop for Config2StateTestGuard {
+        fn drop(&mut self) {
+            *CONFIG2.write().unwrap() = self.original_config.clone();
+        }
+    }
+
+    impl KeyPairCacheTestGuard {
+        fn new() -> Self {
+            Self {
+                original_key_pair: KEY_PAIR.lock().unwrap().take(),
+            }
+        }
+    }
+
+    impl Drop for KeyPairCacheTestGuard {
+        fn drop(&mut self) {
+            *KEY_PAIR.lock().unwrap() = self.original_key_pair.clone();
         }
     }
 
@@ -3602,7 +3708,9 @@ mod tests {
         use crate::password_security::{clear_key_provider, set_key_provider};
         use std::sync::Arc;
 
-        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _guard = CONFIG_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let path = Config::file();
         let _file_guard = ConfigFileRestoreGuard::new(path.clone());
         if let Some(parent) = path.parent() {
@@ -3641,7 +3749,9 @@ mod tests {
         use crate::password_security::{clear_key_provider, set_key_provider};
         use std::sync::Arc;
 
-        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _guard = CONFIG_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let path = Config::file();
         let _file_guard = ConfigFileRestoreGuard::new(path.clone());
         let _state_guard = ConfigStateTestGuard::new(Config::default(), HashMap::new());
@@ -3673,7 +3783,9 @@ mod tests {
 
     #[test]
     fn test_config2_store_keeps_existing_unlock_pin_when_pin_is_unchanged() {
-        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _guard = CONFIG_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let _file_guard = ConfigFileRestoreGuard::new(Config::file_("2"));
         let pin = "123456";
         let original_unlock_pin =
@@ -3693,6 +3805,194 @@ mod tests {
 
         let stored = Config::load_::<Config2>("2");
         assert_eq!(stored.unlock_pin, original_unlock_pin);
+    }
+
+    #[test]
+    fn test_config2_provider_mismatch_hides_secrets_and_preserves_storage() {
+        use crate::password_security::{clear_key_provider, set_key_provider};
+        use std::sync::Arc;
+
+        let _guard = CONFIG_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _file_guard = ConfigFileRestoreGuard::new(Config::file_("2"));
+        let _state_guard = Config2StateTestGuard::new();
+
+        set_key_provider(Arc::new(TestMachineKeyProvider));
+        let protected_pin =
+            encrypt_str_or_original_scoped("123456", KeyScope::Machine, ENCRYPT_MAX_LEN);
+        let protected_socks_password =
+            encrypt_str_or_original_scoped("proxy-secret", KeyScope::Machine, ENCRYPT_MAX_LEN);
+        Config::store_(
+            &Config2 {
+                unlock_pin: protected_pin.clone(),
+                socks: Some(Socks5Server {
+                    password: protected_socks_password.clone(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            "2",
+        );
+
+        set_key_provider(Arc::new(AlternateKeyProvider));
+        let loaded = Config2::load();
+        assert!(loaded.unlock_pin.is_empty());
+        assert!(loaded.socks.as_ref().unwrap().password.is_empty());
+        *CONFIG2.write().unwrap() = loaded.clone();
+        assert_eq!(Config::get_unlock_pin(), "");
+
+        loaded.store();
+
+        let stored = Config::load_::<Config2>("2");
+        assert_eq!(stored.unlock_pin, protected_pin);
+        assert_eq!(
+            stored.socks.as_ref().unwrap().password,
+            protected_socks_password
+        );
+
+        set_key_provider(Arc::new(TestMachineKeyProvider));
+        let recovered = Config2::load();
+        assert_eq!(recovered.unlock_pin, "123456");
+        assert_eq!(recovered.socks.as_ref().unwrap().password, "proxy-secret");
+        clear_key_provider();
+    }
+
+    #[test]
+    fn test_key_pair_provider_mismatch_does_not_regenerate_or_overwrite_storage() {
+        use crate::password_security::{clear_key_provider, set_key_provider};
+        use std::sync::Arc;
+
+        let _guard = CONFIG_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _file_guard = ConfigFileRestoreGuard::new(Config::file());
+        let _cache_guard = KeyPairCacheTestGuard::new();
+        let secret_key = vec![0x11; sign::SECRETKEYBYTES];
+        let public_key = vec![0x22; sign::PUBLICKEYBYTES];
+
+        set_key_provider(Arc::new(TestMachineKeyProvider));
+        let protected_secret_key =
+            encrypt_vec_or_original_scoped(&secret_key, KeyScope::Machine, 1024);
+        Config::store_(
+            &Config {
+                id: "123456789".to_owned(),
+                key_pair: (protected_secret_key.clone(), public_key.clone()),
+                ..Default::default()
+            },
+            "",
+        );
+
+        set_key_provider(Arc::new(AlternateKeyProvider));
+        let loaded = Config::load();
+        assert!(loaded.key_pair.0.is_empty());
+        assert_eq!(loaded.key_pair.1, public_key);
+        assert_eq!(Config::load_::<Config>("").key_pair.0, protected_secret_key);
+
+        assert!(Config::get_existing_key_pair().is_none());
+        assert!(KEY_PAIR.lock().unwrap().is_none());
+        let unavailable = Config::get_key_pair();
+        assert!(unavailable.0.is_empty());
+        assert_eq!(unavailable.1, public_key);
+        assert!(KEY_PAIR.lock().unwrap().is_none());
+        assert_eq!(Config::load_::<Config>("").key_pair.0, protected_secret_key);
+
+        set_key_provider(Arc::new(TestMachineKeyProvider));
+        assert_eq!(Config::get_key_pair(), (secret_key, public_key));
+        clear_key_provider();
+    }
+
+    #[test]
+    fn test_user_scoped_provider_mismatch_hides_options_and_preserves_storage() {
+        use crate::password_security::{clear_key_provider, set_key_provider};
+        use std::sync::Arc;
+
+        let _guard = CONFIG_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let peer_id = "scoped-provider-mismatch-test";
+        let peer_path = PeerConfig::path(peer_id);
+        let _peer_file_guard = ConfigFileRestoreGuard::new(peer_path.clone());
+        let _local_file_guard = ConfigFileRestoreGuard::new(Config::file_("_local"));
+        if let Some(parent) = peer_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        set_key_provider(Arc::new(TestMachineKeyProvider));
+        let protected_peer_password =
+            encrypt_vec_or_original_scoped(b"peer-secret", KeyScope::User, ENCRYPT_MAX_LEN);
+        let protected_rdp_password =
+            encrypt_str_or_original_scoped("rdp-secret", KeyScope::User, ENCRYPT_MAX_LEN);
+        let protected_os_password =
+            encrypt_str_or_original_scoped("os-secret", KeyScope::User, ENCRYPT_MAX_LEN);
+        let protected_access_token =
+            encrypt_str_or_original_scoped("token-secret", KeyScope::User, 1024 * 1024);
+        store_path(
+            peer_path,
+            PeerConfig {
+                password: protected_peer_password.clone(),
+                options: HashMap::from([
+                    ("rdp_password".to_owned(), protected_rdp_password.clone()),
+                    ("os-password".to_owned(), protected_os_password.clone()),
+                ]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        Config::store_(
+            &LocalConfig {
+                options: HashMap::from([(
+                    "access_token".to_owned(),
+                    protected_access_token.clone(),
+                )]),
+                ..Default::default()
+            },
+            "_local",
+        );
+
+        set_key_provider(Arc::new(AlternateKeyProvider));
+        let loaded_peer = PeerConfig::load(peer_id);
+        assert!(loaded_peer.password.is_empty());
+        assert_eq!(loaded_peer.options.get("rdp_password").unwrap(), "");
+        assert_eq!(loaded_peer.options.get("os-password").unwrap(), "");
+        let loaded_local = LocalConfig::load();
+        assert_eq!(loaded_local.options.get("access_token").unwrap(), "");
+
+        loaded_peer.store(peer_id);
+        loaded_local.store();
+
+        let stored_peer: PeerConfig = load_path(PeerConfig::path(peer_id));
+        assert_eq!(stored_peer.password, protected_peer_password);
+        assert_eq!(
+            stored_peer.options.get("rdp_password").unwrap(),
+            &protected_rdp_password
+        );
+        assert_eq!(
+            stored_peer.options.get("os-password").unwrap(),
+            &protected_os_password
+        );
+        let stored_local = Config::load_::<LocalConfig>("_local");
+        assert_eq!(
+            stored_local.options.get("access_token").unwrap(),
+            &protected_access_token
+        );
+
+        set_key_provider(Arc::new(TestMachineKeyProvider));
+        let recovered_peer = PeerConfig::load(peer_id);
+        assert_eq!(recovered_peer.password, b"peer-secret");
+        assert_eq!(
+            recovered_peer.options.get("rdp_password").unwrap(),
+            "rdp-secret"
+        );
+        assert_eq!(
+            recovered_peer.options.get("os-password").unwrap(),
+            "os-secret"
+        );
+        assert_eq!(
+            LocalConfig::load().options.get("access_token").unwrap(),
+            "token-secret"
+        );
+        clear_key_provider();
     }
 
     #[test]
@@ -3723,7 +4023,9 @@ mod tests {
 
         static LOGGER: DuplicateEncryptionLogger = DuplicateEncryptionLogger;
 
-        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _guard = CONFIG_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let path = Config::file_("2");
         let _file_guard = ConfigFileRestoreGuard::new(path.clone());
         if let Some(parent) = path.parent() {
@@ -3760,7 +4062,9 @@ mod tests {
         use crate::password_security::{clear_key_provider, set_key_provider};
         use std::sync::Arc;
 
-        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _guard = CONFIG_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let path = Config::file_("2");
         let _file_guard = ConfigFileRestoreGuard::new(path.clone());
         if let Some(parent) = path.parent() {

@@ -330,6 +330,9 @@ pub fn decrypt_vec_or_original(v: &[u8], current_version: &str) -> (Vec<u8>, boo
 }
 
 pub fn encrypt_str_or_original_scoped(s: &str, scope: KeyScope, max_len: usize) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
     if is_scoped_encrypted(s.as_bytes()) {
         return s.to_owned();
     }
@@ -359,6 +362,9 @@ pub fn decrypt_str_or_original_scoped(s: &str, scope: KeyScope) -> (String, bool
 }
 
 pub fn encrypt_vec_or_original_scoped(v: &[u8], scope: KeyScope, max_len: usize) -> Vec<u8> {
+    if v.is_empty() {
+        return Vec::new();
+    }
     if is_scoped_encrypted(v) {
         return v.to_owned();
     }
@@ -412,6 +418,9 @@ fn decrypt_bytes_or_original_scoped(v: &[u8], scope: KeyScope) -> (Vec<u8>, bool
 }
 
 pub fn symmetric_crypt_scoped(data: &[u8], encrypt: bool, scope: KeyScope) -> Result<Vec<u8>, ()> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
     if encrypt {
         return match encrypt_scoped_payload(data, scope) {
             Ok(encrypted) => {
@@ -949,6 +958,31 @@ mod test {
             assert!(encrypted.starts_with(prefix.as_bytes()));
             let (plain, decrypted, store_again) = decrypt_vec_or_original_scoped(&encrypted, scope);
             assert_eq!(plain, b"secret");
+            assert!(decrypted);
+            assert!(!store_again);
+        }
+        clear_key_provider();
+    }
+
+    #[test]
+    fn test_scoped_encryption_keeps_empty_values_empty() {
+        use super::*;
+
+        set_key_provider(Arc::new(TestKeyProvider));
+        for scope in [KeyScope::Machine, KeyScope::User] {
+            assert_eq!(encrypt_str_or_original_scoped("", scope, 128), "");
+            assert_eq!(encrypt_vec_or_original_scoped(b"", scope, 128), b"");
+            assert_eq!(symmetric_crypt_scoped(b"", true, scope).unwrap(), b"");
+            assert_eq!(symmetric_crypt_scoped(b"", false, scope).unwrap(), b"");
+
+            let legacy_empty = scope.version().to_owned()
+                + &base64::encode(
+                    encrypt_scoped_payload(b"", scope).unwrap(),
+                    base64::Variant::Original,
+                );
+            let (plain, decrypted, store_again) =
+                decrypt_str_or_original_scoped(&legacy_empty, scope);
+            assert!(plain.is_empty());
             assert!(decrypted);
             assert!(!store_again);
         }
