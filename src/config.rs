@@ -37,9 +37,9 @@ use crate::{
     log,
     password_security::{
         decrypt_str_or_original_scoped, decrypt_vec_or_original_scoped,
-        encrypt_str_or_original_scoped, encrypt_vec_or_original_scoped, is_scoped_crypt_payload,
-        is_scoped_encrypted, key_available, key_provider_registered, preserve_stored_value,
-        symmetric_crypt_scoped, KeyScope,
+        encrypt_str_or_original_scoped, encrypt_vec_or_original_scoped, is_any_crypt_payload,
+        is_scoped_crypt_payload, is_scoped_encrypted, key_available, key_provider_registered,
+        preserve_stored_value, symmetric_crypt_scoped, KeyScope,
     },
 };
 
@@ -83,6 +83,11 @@ lazy_static::lazy_static! {
     pub static ref OVERWRITE_LOCAL_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
     pub static ref HARD_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
     pub static ref BUILTIN_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CONFIG_FILE: std::cell::RefCell<Option<PathBuf>> = Default::default();
 }
 
 #[cfg(target_os = "android")]
@@ -217,6 +222,8 @@ pub struct Config {
     enc_id: String, // store
     #[serde(skip)]
     id_protected_unavailable: bool,
+    #[serde(skip)]
+    config_file_unavailable: bool,
     #[serde(default, deserialize_with = "deserialize_string")]
     password: String,
     #[serde(default, deserialize_with = "deserialize_string")]
@@ -695,22 +702,36 @@ fn keep_scoped_encrypted_vec_if_plaintext_unchanged(
     encrypt_vec_or_original_scoped(plain, scope, max_len)
 }
 
-pub fn load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug>(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoadPathStatus {
+    Loaded,
+    NotFound,
+    Unavailable,
+}
+
+fn load_path_with_status<
+    T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug,
+>(
     file: PathBuf,
-) -> T {
-    let cfg = match confy::load_path(&file) {
-        Ok(config) => config,
+) -> (T, LoadPathStatus) {
+    match confy::load_path(&file) {
+        Ok(config) => (config, LoadPathStatus::Loaded),
         Err(err) => {
             if let confy::ConfyError::GeneralLoadError(err) = &err {
                 if err.kind() == std::io::ErrorKind::NotFound {
-                    return T::default();
+                    return (T::default(), LoadPathStatus::NotFound);
                 }
             }
             log::error!("Failed to load config '{}': {}", file.display(), err);
-            T::default()
+            (T::default(), LoadPathStatus::Unavailable)
         }
-    };
-    cfg
+    }
+}
+
+pub fn load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug>(
+    file: PathBuf,
+) -> T {
+    load_path_with_status(file).0
 }
 
 #[inline]
@@ -734,12 +755,20 @@ impl Config {
     fn load_<T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug>(
         suffix: &str,
     ) -> T {
+        Self::load_with_status(suffix).0
+    }
+
+    fn load_with_status<
+        T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug,
+    >(
+        suffix: &str,
+    ) -> (T, LoadPathStatus) {
         let file = Self::file_(suffix);
-        let cfg = load_path(file);
+        let (cfg, status) = load_path_with_status(file);
         if suffix.is_empty() {
             log::trace!("{:?}", cfg);
         }
-        cfg
+        (cfg, status)
     }
 
     fn store_<T: serde::Serialize>(config: &T, suffix: &str) {
@@ -750,7 +779,12 @@ impl Config {
     }
 
     fn load() -> Config {
-        let mut config = Config::load_::<Config>("");
+        let (mut config, load_status) = Config::load_with_status::<Config>("");
+        if load_status == LoadPathStatus::Unavailable {
+            config.id_protected_unavailable = true;
+            config.config_file_unavailable = true;
+            return config;
+        }
         let mut store = false;
         match Self::validate_or_decrypt_permanent_password_storage(&mut config) {
             Ok(store2) => store |= store2,
@@ -761,7 +795,7 @@ impl Config {
         let mut id_valid = false;
         let (id, encrypted, store2) =
             decrypt_str_or_original_scoped(&config.enc_id, KeyScope::Machine);
-        if is_scoped_encrypted(config.enc_id.as_bytes()) && !encrypted {
+        if is_any_crypt_payload(config.enc_id.as_bytes()) && !encrypted {
             log::error!(
                 "Protected device ID cannot be decrypted; preserving the stored ID without regeneration"
             );
@@ -879,6 +913,9 @@ impl Config {
     }
 
     fn store(&self) {
+        if self.config_file_unavailable {
+            return;
+        }
         let mut config = self.clone();
         let stored = Config::load_::<Config>("");
         let id_available = Self::try_unlock_protected_id(&mut config);
@@ -940,6 +977,12 @@ impl Config {
     }
 
     fn file_(suffix: &str) -> PathBuf {
+        #[cfg(test)]
+        if suffix.is_empty() {
+            if let Some(path) = TEST_CONFIG_FILE.with(|path| path.borrow().clone()) {
+                return path;
+            }
+        }
         let name = format!("{}{}", *APP_NAME.read().unwrap(), suffix);
         Config::with_extension(Self::path(name))
     }
@@ -1369,10 +1412,13 @@ impl Config {
         }
 
         // IMPORTANT: this path is called while holding KEY_PAIR lock.
-        // Config::load_ must remain a raw conf load/deserialize path. Scoped payloads
+        // Config::load_with_status must remain a raw conf load/deserialize path. Scoped payloads
         // can be opened directly without the legacy symmetric_crypt fallback that
         // re-enters this function while KEY_PAIR is locked.
-        let mut config = Config::load_::<Config>("");
+        let (mut config, load_status) = Config::load_with_status::<Config>("");
+        if load_status == LoadPathStatus::Unavailable {
+            return None;
+        }
         if is_scoped_crypt_payload(&config.key_pair.0) {
             let (secret_key, decrypted, _) = decrypt_secret_or_empty_scoped(
                 &config.key_pair.0,
@@ -3313,6 +3359,11 @@ mod tests {
         original_content: Option<Vec<u8>>,
     }
 
+    struct TestConfigFileGuard {
+        path: PathBuf,
+        previous: Option<PathBuf>,
+    }
+
     struct Config2StateTestGuard {
         original_config: Config2,
     }
@@ -3361,6 +3412,33 @@ mod tests {
             } else {
                 fs::remove_file(&self.path).ok();
             }
+        }
+    }
+
+    impl TestConfigFileGuard {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "hbb-common-config-test-{}-{}.toml",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            let previous = TEST_CONFIG_FILE.with(|slot| slot.replace(Some(path.clone())));
+            Self { path, previous }
+        }
+    }
+
+    impl Drop for TestConfigFileGuard {
+        fn drop(&mut self) {
+            match fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => log::error!(
+                    "Failed to remove test config '{}': {}",
+                    self.path.display(),
+                    err
+                ),
+            }
+            TEST_CONFIG_FILE.with(|slot| *slot.borrow_mut() = self.previous.clone());
         }
     }
 
@@ -3703,7 +3781,69 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    fn test_load_preserves_corrupt_legacy_enc_id_without_generating_id() {
+        use crate::password_security::clear_key_provider;
+
+        let _guard = CONFIG_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let file_guard = TestConfigFileGuard::new();
+        let path = file_guard.path.clone();
+        clear_key_provider();
+        let original = b"enc_id = \"00not-valid-base64!\"\nkey_confirmed = true\n";
+        fs::write(&path, original).unwrap();
+
+        let mut loaded = Config::load();
+
+        assert!(loaded.id.is_empty());
+        assert!(loaded.id_protected_unavailable);
+        assert!(!Config::try_unlock_protected_id(&mut loaded));
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn test_load_preserves_invalid_existing_config_without_generating_id() {
+        use crate::password_security::clear_key_provider;
+
+        let _guard = CONFIG_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let file_guard = TestConfigFileGuard::new();
+        let path = file_guard.path.clone();
+        let _cache_guard = KeyPairCacheTestGuard::new();
+        clear_key_provider();
+        let original = b"this is not valid TOML = [";
+        fs::write(&path, original).unwrap();
+
+        let loaded = Config::load();
+        loaded.store();
+
+        assert!(loaded.id.is_empty());
+        assert!(loaded.id_protected_unavailable);
+        assert!(loaded.config_file_unavailable);
+        assert!(Config::get_existing_key_pair().is_none());
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn test_load_generates_id_when_config_is_absent() {
+        use crate::password_security::clear_key_provider;
+
+        let _guard = CONFIG_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let file_guard = TestConfigFileGuard::new();
+        let path = file_guard.path.clone();
+        clear_key_provider();
+
+        let loaded = Config::load();
+
+        assert!(!loaded.id.is_empty());
+        assert!(!loaded.id_protected_unavailable);
+        assert!(path.is_file());
+    }
+
+    #[test]
     fn test_load_migrates_legacy_enc_id_on_store() {
         use crate::password_security::{clear_key_provider, set_key_provider};
         use std::sync::Arc;
@@ -3711,11 +3851,7 @@ mod tests {
         let _guard = CONFIG_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
-        let path = Config::file();
-        let _file_guard = ConfigFileRestoreGuard::new(path.clone());
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
+        let _file_guard = TestConfigFileGuard::new();
         clear_key_provider();
         let id = "123456789";
         let legacy_id = encrypt_str_or_original(id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);

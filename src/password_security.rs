@@ -236,6 +236,10 @@ pub fn is_scoped_crypt_payload(v: &[u8]) -> bool {
             || v.starts_with(USER_ENC_VERSION.as_bytes()))
 }
 
+pub(crate) fn is_any_crypt_payload(v: &[u8]) -> bool {
+    v.starts_with(b"00") || is_scoped_crypt_payload(v)
+}
+
 pub fn is_scoped_encrypted(v: &[u8]) -> bool {
     if !is_scoped_crypt_payload(v) {
         return false;
